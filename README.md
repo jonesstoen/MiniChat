@@ -191,6 +191,6 @@ Mini Chat is an independent project and is not affiliated with, endorsed by or s
 
 ## Author
 
-Built by Johannes, a computer science master's student at the University of Oslo.
+Built by Johannes Støen, a computer science master's student at the University of Oslo.
 
 [johannesstoen.no](https://johannesstoen.no) · [GitHub](https://github.com/jonesstoen)
