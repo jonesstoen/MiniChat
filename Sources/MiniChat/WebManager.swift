@@ -1,0 +1,403 @@
+import AppKit
+import WebKit
+
+/// Owns one WKWebView per service. They live as long as the app runs,
+/// so your chat is still there when you reopen the window.
+@MainActor
+final class WebManager: NSObject, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler, WKDownloadDelegate, NSWindowDelegate {
+    static let shared = WebManager()
+
+    private var views: [Service: WKWebView] = [:]
+    private var observations: [NSKeyValueObservation] = []
+    private var downloadDestinations: [ObjectIdentifier: URL] = [:]
+    private var popups: [NSWindow] = []
+
+    /// Regular Safari user agent, so the sites treat us like a normal browser.
+    static let userAgent =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+
+    /// Domains that open inside the window. Other links open in the default browser.
+    private static let internalHosts = [
+        "chatgpt.com", "openai.com", "claude.ai", "claude.com", "anthropic.com",
+        "google.com", "apple.com", "microsoftonline.com", "live.com", "microsoft.com",
+    ]
+
+    private static let focusScript = """
+    (() => {
+      const el = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"], div[contenteditable="true"], textarea');
+      if (el) { el.focus(); }
+      return true;
+    })();
+    """
+
+
+    /// Checks every half second whether the page is writing an answer (a stop button exists)
+    /// and tells the app when that changes.
+    private static let watcherScript = #"""
+    (() => {
+      if (window.__miniChatWatcher) return;
+      window.__miniChatWatcher = true;
+      let last = null;
+      const isBusy = () => !!document.querySelector(
+        '[data-testid="stop-button"], [data-is-streaming="true"], button[aria-label*="stop" i]'
+      );
+      setInterval(() => {
+        const busy = isBusy();
+        if (busy !== last) {
+          last = busy;
+          try { window.webkit.messageHandlers.minichat.postMessage({ busy }); } catch (e) {}
+        }
+      }, 500);
+    })();
+    """#
+
+    func webView(for service: Service) -> WKWebView {
+        if let existing = views[service] { return existing }
+
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default() // keeps you signed in across restarts
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+        configuration.userContentController.addUserScript(
+            WKUserScript(source: Self.watcherScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        )
+        configuration.userContentController.add(self, name: "minichat")
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.customUserAgent = Self.userAgent
+        webView.uiDelegate = self
+        webView.navigationDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+        webView.load(URLRequest(url: service.homeURL))
+        views[service] = webView
+
+        // Remember visited chats (URL and title change without a full page load).
+        observations.append(webView.observe(\.url, options: [.new]) { _, _ in
+            Task { @MainActor in WebManager.shared.noteVisit(service) }
+        })
+        observations.append(webView.observe(\.title, options: [.new]) { _, _ in
+            Task { @MainActor in WebManager.shared.noteVisit(service) }
+        })
+        return webView
+    }
+
+    private func noteVisit(_ service: Service) {
+        let webView = webView(for: service)
+        guard let url = webView.url else { return }
+        AppState.shared.recordVisit(service: service, url: url, title: webView.title)
+    }
+
+    func load(_ address: String, in service: Service) {
+        guard let url = URL(string: address) else { return }
+        let webView = webView(for: service)
+        if webView.url?.absoluteString.hasPrefix(address) == true { return }
+        webView.load(URLRequest(url: url))
+    }
+
+    func newChat(_ service: Service) {
+        webView(for: service).load(URLRequest(url: service.homeURL))
+    }
+
+    func reload(_ service: Service) {
+        webView(for: service).reload()
+    }
+
+    func openInBrowser(_ service: Service) {
+        let url = webView(for: service).url ?? service.homeURL
+        NSWorkspace.shared.open(url)
+    }
+
+    func focusInput(_ service: Service) {
+        let webView = webView(for: service)
+        webView.window?.makeFirstResponder(webView)
+        webView.evaluateJavaScript(Self.focusScript, completionHandler: nil)
+    }
+
+    /// Takes a tiny snapshot of the top strip of the page and uses
+    /// its color, so the top bar matches exactly what you see.
+    func refreshTheme(_ service: Service) {
+        let webView = webView(for: service)
+        // Skip while loading: a blank page would be read as white.
+        guard webView.window != nil, !webView.isLoading,
+              webView.bounds.width > 20, webView.bounds.height > 20 else { return }
+
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = NSRect(x: 0, y: 0, width: webView.bounds.width, height: 6)
+        configuration.afterScreenUpdates = true
+
+        webView.takeSnapshot(with: configuration) { image, _ in
+            guard let image, let rgb = Self.dominantColor(in: image) else { return }
+            Task { @MainActor in
+                AppState.shared.setTheme(red: rgb.0, green: rgb.1, blue: rgb.2, for: service)
+            }
+        }
+    }
+
+    /// Finds the most common color in the image (in sRGB).
+    nonisolated static func dominantColor(in image: NSImage) -> (Double, Double, Double)? {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let width = cgImage.width, height = cgImage.height
+        guard width > 0, height > 0 else { return nil }
+
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let drawn: Bool = pixels.withUnsafeMutableBytes { buffer in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard drawn else { return nil }
+
+        var counts: [UInt32: Int] = [:]
+        let step = max(1, width / 60)
+        for y in 0..<height {
+            for x in stride(from: 0, to: width, by: step) {
+                let i = (y * width + x) * 4
+                guard pixels[i + 3] > 200 else { continue }
+                let key = UInt32(pixels[i]) << 16 | UInt32(pixels[i + 1]) << 8 | UInt32(pixels[i + 2])
+                counts[key, default: 0] += 1
+            }
+        }
+        guard let best = counts.max(by: { $0.value < $1.value })?.key else { return nil }
+        return (
+            Double((best >> 16) & 0xFF) / 255,
+            Double((best >> 8) & 0xFF) / 255,
+            Double(best & 0xFF) / 255
+        )
+    }
+
+    private func service(for webView: WKWebView) -> Service? {
+        views.first { $0.value === webView }?.key
+    }
+
+    private static func isInternal(_ host: String) -> Bool {
+        internalHosts.contains { host == $0 || host.hasSuffix("." + $0) }
+    }
+
+    // MARK: Messages from the page
+
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard message.name == "minichat",
+              let body = message.body as? [String: Any],
+              let busy = body["busy"] as? Bool,
+              let webView = message.webView,
+              let service = service(for: webView) else { return }
+        AppState.shared.setBusy(busy, for: service)
+    }
+
+    // MARK: Navigation
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let service = service(for: webView) else { return }
+        refreshTheme(service)
+        // Some pages set their color shortly after loading.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            self.refreshTheme(service)
+        }
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        // Links with a download attribute (typically files the assistant created).
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download)
+            return
+        }
+        if navigationAction.navigationType == .linkActivated,
+           navigationAction.targetFrame?.isMainFrame == true,
+           let url = navigationAction.request.url,
+           let host = url.host,
+           !Self.isInternal(host) {
+            NSWorkspace.shared.open(url)
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView,
+                 decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        // Files meant to be downloaded, or that can't be displayed: save to Downloads.
+        let disposition = (navigationResponse.response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Content-Disposition")?.lowercased() ?? ""
+        if disposition.contains("attachment") || !navigationResponse.canShowMIMEType {
+            decisionHandler(.download)
+            return
+        }
+        // Images, PDFs and similar: open in the browser instead of taking over the window.
+        if navigationResponse.isForMainFrame,
+           let mime = navigationResponse.response.mimeType?.lowercased(),
+           !mime.hasPrefix("text/html"),
+           !mime.hasPrefix("application/xhtml"),
+           let url = navigationResponse.response.url,
+           url.scheme == "https" {
+            NSWorkspace.shared.open(url)
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    // MARK: Crash recovery
+
+    /// If the page's web process crashes, the view goes blank. Reload it.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        if webView.url != nil {
+            webView.reload()
+        } else if let service = service(for: webView) {
+            webView.load(URLRequest(url: service.homeURL))
+        }
+    }
+
+    // MARK: Downloads
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    func download(_ download: WKDownload,
+                  decideDestinationUsing response: URLResponse,
+                  suggestedFilename: String,
+                  completionHandler: @escaping (URL?) -> Void) {
+        let folder = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
+        let destination = Self.uniqueURL(in: folder, name: suggestedFilename)
+        downloadDestinations[ObjectIdentifier(download)] = destination
+        completionHandler(destination)
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let url = downloadDestinations.removeValue(forKey: ObjectIdentifier(download)) else { return }
+        // Makes the Downloads stack in the Dock bounce, like Safari does.
+        DistributedNotificationCenter.default().post(
+            name: Notification.Name("com.apple.DownloadFileFinished"), object: url.path
+        )
+        Notifier.postDownload(url)
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
+        NSSound.beep()
+    }
+
+    func openDownloadsFolder() {
+        NSWorkspace.shared.open(FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0])
+    }
+
+    /// "file.pdf" becomes "file 2.pdf" if it already exists.
+    private static func uniqueURL(in folder: URL, name: String) -> URL {
+        let safeName = name.isEmpty ? L("Nedlasting") : name.replacingOccurrences(of: "/", with: "-")
+        var candidate = folder.appendingPathComponent(safeName)
+        let base = candidate.deletingPathExtension().lastPathComponent
+        let ext = candidate.pathExtension
+        var number = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            let next = ext.isEmpty ? "\(base) \(number)" : "\(base) \(number).\(ext)"
+            candidate = folder.appendingPathComponent(next)
+            number += 1
+        }
+        return candidate
+    }
+
+    // MARK: New windows (Google/Apple sign-in, target=_blank links)
+
+    func webView(_ webView: WKWebView,
+                 createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? {
+        // Regular links that want a new tab: send them to the browser.
+        if navigationAction.navigationType == .linkActivated, let url = navigationAction.request.url {
+            NSWorkspace.shared.open(url)
+            return nil
+        }
+
+        // Script-opened windows (typically sign-in): show them in a small separate window.
+        let popup = WKWebView(frame: NSRect(x: 0, y: 0, width: 500, height: 680), configuration: configuration)
+        popup.customUserAgent = Self.userAgent
+        popup.uiDelegate = self
+
+        let window = NSWindow(
+            contentRect: popup.frame,
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Logg inn"
+        window.contentView = popup
+        window.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.center()
+        popups.append(window)
+
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        return popup
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        guard let window = webView.window, popups.contains(window) else { return }
+        window.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        popups.removeAll { $0 == window }
+    }
+
+    // MARK: File uploads and JavaScript dialogs
+
+    func webView(_ webView: WKWebView,
+                 runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping ([URL]?) -> Void) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.canChooseFiles = true
+        NSApp.activate(ignoringOtherApps: true)
+        if let window = webView.window {
+            panel.beginSheetModal(for: window) { response in
+                completionHandler(response == .OK ? panel.urls : nil)
+            }
+        } else {
+            completionHandler(panel.runModal() == .OK ? panel.urls : nil)
+        }
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptAlertPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping () -> Void) {
+        let alert = NSAlert()
+        alert.messageText = message
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+        completionHandler()
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (Bool) -> Void) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: L("Avbryt"))
+        NSApp.activate(ignoringOtherApps: true)
+        completionHandler(alert.runModal() == .alertFirstButtonReturn)
+    }
+}
