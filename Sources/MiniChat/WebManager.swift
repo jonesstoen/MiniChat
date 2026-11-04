@@ -10,6 +10,13 @@ final class WebManager: NSObject, WKUIDelegate, WKNavigationDelegate, WKScriptMe
     private var views: [Service: WKWebView] = [:]
     private var observations: [NSKeyValueObservation] = []
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
+    /// Prompts from the quick bar waiting for their new chat page to load.
+    private var pendingPrompts: [Service: PendingPrompt] = [:]
+
+    private struct PendingPrompt {
+        let text: String
+        let files: [URL]
+    }
     private var popups: [NSWindow] = []
 
     /// Regular Safari user agent, so the sites treat us like a normal browser.
@@ -95,6 +102,104 @@ final class WebManager: NSObject, WKUIDelegate, WKNavigationDelegate, WKScriptMe
 
     func newChat(_ service: Service) {
         webView(for: service).load(URLRequest(url: service.homeURL))
+    }
+
+    /// Starts a new chat and sends the prompt. The prompt goes in the URL (?q=),
+    /// which both sites have supported. If the page doesn't send it on its own,
+    /// sendPendingPrompt types it into the input and presses send.
+    /// With attachments, the URL trick is skipped (it would send before the files are
+    /// added): the files are pasted into the input first, then the text is typed and sent.
+    func startChat(_ prompt: String, files: [URL] = [], in service: Service) {
+        var url = service.homeURL
+        if files.isEmpty, !prompt.isEmpty {
+            var components = URLComponents(url: service.homeURL, resolvingAgainstBaseURL: false)
+            components?.queryItems = [URLQueryItem(name: "q", value: prompt)]
+            url = components?.url ?? url
+        }
+        pendingPrompts[service] = PendingPrompt(text: prompt, files: files)
+        webView(for: service).load(URLRequest(url: url))
+    }
+
+    private static let sendAfterUploadScript = #"""
+    const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const input = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"], div[contenteditable="true"], textarea');
+    if (input && text) {
+      input.focus();
+      document.execCommand('insertText', false, text);
+    }
+    const findSend = () => document.querySelector('[data-testid="send-button"], button[aria-label*="send" i]');
+    const ready = button => button && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+    // Wait (up to about 30 s) until the uploads are done and the send button is enabled.
+    for (let i = 0; i < 100; i++) {
+      if (ready(findSend())) {
+        await wait(400);
+        const button = findSend();
+        if (ready(button)) { button.click(); return 'clicked'; }
+      }
+      await wait(300);
+    }
+    return 'timeout';
+    """#
+
+    /// Pastes the files into the chat input through the clipboard (the same way as ⌘V),
+    /// then types the text and sends once the upload is done. The clipboard is restored.
+    private func sendWithAttachments(_ pending: PendingPrompt, in service: Service) {
+        focusInput(service)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            let webView = self.webView(for: service)
+            let snapshot = AttachmentStore.snapshotPasteboard()
+            AttachmentStore.writeToPasteboard(pending.files)
+            webView.window?.makeFirstResponder(webView)
+            NSApp.sendAction(#selector(NSText.paste(_:)), to: webView, from: nil)
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                AttachmentStore.restorePasteboard(snapshot)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                webView.callAsyncJavaScript(
+                    Self.sendAfterUploadScript, arguments: ["text": pending.text], in: nil, in: .page
+                ) { result in
+                    if case .failure(let error) = result {
+                        NSLog("Mini Chat: could not send attachment: \(error.localizedDescription)")
+                    }
+                }
+            }
+        }
+    }
+
+    private static let sendPromptScript = #"""
+    const isBusy = () => !!document.querySelector('[data-testid="stop-button"], [data-is-streaming="true"], button[aria-label*="stop" i]');
+    const hasUserMessage = () => !!document.querySelector('[data-message-author-role="user"], [data-testid="user-message"]');
+    const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Give the page a moment: if ?q= worked, the message is already on its way.
+    for (let i = 0; i < 10; i++) {
+      if (isBusy() || hasUserMessage()) return 'sent';
+      await wait(300);
+    }
+
+    const input = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"], div[contenteditable="true"], textarea');
+    if (!input) return 'no-input';
+    input.focus();
+    const current = ((input.value !== undefined ? input.value : input.innerText) || '').trim();
+    if (!current) {
+      document.execCommand('insertText', false, text);
+      await wait(400);
+    }
+    const send = document.querySelector('[data-testid="send-button"], button[aria-label*="send" i]');
+    if (send && !send.disabled) { send.click(); return 'clicked'; }
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    return 'enter';
+    """#
+
+    private func sendPendingPrompt(_ prompt: String, in service: Service) {
+        webView(for: service).callAsyncJavaScript(
+            Self.sendPromptScript, arguments: ["text": prompt], in: nil, in: .page
+        ) { result in
+            if case .failure(let error) = result {
+                NSLog("Mini Chat: could not send prompt: \(error.localizedDescription)")
+            }
+        }
     }
 
     func reload(_ service: Service) {
@@ -197,6 +302,15 @@ final class WebManager: NSObject, WKUIDelegate, WKNavigationDelegate, WKScriptMe
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let service = service(for: webView) else { return }
+        if let pending = pendingPrompts.removeValue(forKey: service) {
+            DispatchQueue.main.asyncAfter(deadline: pending.files.isEmpty ? .now() + 0.8 : .now() + 1.2) {
+                if pending.files.isEmpty {
+                    self.sendPendingPrompt(pending.text, in: service)
+                } else {
+                    self.sendWithAttachments(pending, in: service)
+                }
+            }
+        }
         refreshTheme(service)
         // Some pages set their color shortly after loading.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {

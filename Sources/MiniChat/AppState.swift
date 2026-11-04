@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import AppKit
 import Observation
 
@@ -81,6 +82,30 @@ final class AppState {
         didSet { UserDefaults.standard.set(pinned, forKey: "pinned") }
     }
     var history: [ChatEntry] = AppState.loadHistory()
+
+    /// Quick bar: a small input line shown instead of the full window after a break.
+    var quickBarMode = false
+    var quickQuery = ""
+    /// Bumped to move keyboard focus into the quick bar.
+    var focusTick = 0
+    var quickAttachments: [QuickAttachment] = []
+    /// True while something is dragged over the quick bar.
+    var dropTargeted = false
+    /// True while the screenshot tool is open, so the window doesn't auto-hide.
+    @ObservationIgnored var capturingScreenshot = false
+    /// Minutes without the window open before ⌥Space shows the quick bar (0 = off).
+    var idleResetMinutes: Int = (UserDefaults.standard.object(forKey: "idleResetMinutes") as? Int) ?? 60 {
+        didSet { UserDefaults.standard.set(idleResetMinutes, forKey: "idleResetMinutes") }
+    }
+    @ObservationIgnored var lastHidden: Date? = UserDefaults.standard.object(forKey: "lastHidden") as? Date {
+        didSet { UserDefaults.standard.set(lastHidden, forKey: "lastHidden") }
+    }
+
+    var quickBarDue: Bool {
+        guard idleResetMinutes > 0 else { return false }
+        guard let lastHidden else { return true }
+        return Date().timeIntervalSince(lastHidden) >= Double(idleResetMinutes) * 60
+    }
 
     /// Privacy: puts a neutral cover over the chat.
     var contentHidden = false
@@ -240,12 +265,73 @@ final class AppState {
         applyAppearance()
         // Wait until the view has swapped pages before moving focus.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            WebManager.shared.focusInput(service)
+            // In the quick bar, keep typing in the bar instead of the page.
+            if !AppState.shared.quickBarMode { WebManager.shared.focusInput(service) }
             WebManager.shared.refreshTheme(service)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             WebManager.shared.refreshTheme(service)
         }
+    }
+
+    // MARK: Quick bar attachments
+
+    func addAttachments(_ urls: [URL], copy: Bool = true) {
+        for url in urls where url.isFileURL {
+            guard quickAttachments.count < AttachmentStore.maxCount else { break }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue else { continue }
+            let stored = copy ? (AttachmentStore.copy(url) ?? url) : url
+            quickAttachments.append(QuickAttachment(url: stored, isImage: AttachmentStore.isImage(stored)))
+            NSLog("Mini Chat: attached %@", stored.lastPathComponent)
+        }
+        PanelController.shared.updateBarHeight()
+    }
+
+    /// Handles a drop on the quick bar. A file URL is used directly; anything else that
+    /// is an image (for example the floating screenshot thumbnail) is saved as a file.
+    func attach(from providers: [NSItemProvider]) {
+        NSLog("Mini Chat: dropped %ld item(s)", providers.count)
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                    guard let url, url.isFileURL else { return }
+                    Task { @MainActor in AppState.shared.addAttachments([url]) }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                provider.loadFileRepresentation(forTypeIdentifier: UTType.image.identifier) { url, _ in
+                    // The file is deleted when this handler returns, so copy it right away.
+                    guard let url, let copy = AttachmentStore.copy(url) else { return }
+                    Task { @MainActor in AppState.shared.addAttachments([copy], copy: false) }
+                }
+            }
+        }
+        focusTick += 1
+    }
+
+    func removeAttachment(_ attachment: QuickAttachment) {
+        quickAttachments.removeAll { $0.id == attachment.id }
+        PanelController.shared.updateBarHeight()
+    }
+
+    /// ⌘V in the quick bar: attaches copied files or images. Returns false when
+    /// the clipboard holds text, so it is pasted into the text field as usual.
+    func attachFromPasteboard() -> Bool {
+        let pasteboard = NSPasteboard.general
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self],
+                                             options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !urls.isEmpty {
+            addAttachments(urls)
+            return true
+        }
+        if pasteboard.string(forType: .string) == nil,
+           let image = NSImage(pasteboard: pasteboard),
+           let url = AttachmentStore.save(image) {
+            addAttachments([url], copy: false)
+            return true
+        }
+        return false
     }
 
     func toggleService() {

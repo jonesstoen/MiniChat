@@ -55,7 +55,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             if let raw, let service = Service(rawValue: raw) {
                 AppState.shared.switchTo(service)
             }
-            PanelController.shared.show()
+            PanelController.shared.show(full: true)
         }
         completionHandler()
     }

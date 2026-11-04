@@ -56,9 +56,18 @@ Mini Chat is a native macOS app that recreates the floating chat window and goes
   <img src="docs/screenshots/palette.png" width="270" alt="Command palette">
 </p>
 
+### Quick bar
+
+<p align="center">
+  <img src="docs/quickbar.gif" width="400" alt="Taking a screenshot into the quick bar, asking ChatGPT about it, and the bar growing into the full window">
+</p>
+
+After a break, ⌥Space opens a small quick bar instead of the previous chat. Type a question and press Return: the bar grows into the full window and the question is sent in a new chat. Press Tab to switch between ChatGPT and Claude, and ⌘Return to open the previous chat instead. Attach files and images by pasting them (⌘V), dragging them onto the bar, or taking a screenshot (⌘⇧S). The break length is adjustable in Settings, or the bar can be turned off.
+
 ### Window
 
 - Floating panel that opens with **⌥Space** and hides with **Esc**
+- **Quick bar** after a break: ⌥Space opens a small input line, Return sends the question and the bar grows into the full window (adjustable, or off). Attach files and images by pasting (⌘V), dragging them onto the bar, or taking a screenshot (⌘⇧S)
 - **Peek mode** (**⌥⇧Space**): show the window without taking the keyboard from the app you are working in
 - **Pin**: keep the window on top, or let it hide when you click somewhere else
 - **Expand** to a large window with **⌘E** or a double-click on the top bar
@@ -144,6 +153,8 @@ To build without installing, run `bash build-app.sh`. The app ends up in `build/
 |---|---|
 | ⌥Space | Show / hide the window (works everywhere) |
 | ⌥⇧Space | Peek: show without taking the keyboard |
+| Tab / ⌘Return (quick bar) | Switch service / open the previous chat |
+| ⌘V / ⌘⇧S (quick bar) | Attach a copied file or image / take a screenshot |
 | ⌘J | Command palette |
 | ⌘1 / ⌘2 or Ctrl+Tab | ChatGPT / Claude |
 | ⌘N | New chat |

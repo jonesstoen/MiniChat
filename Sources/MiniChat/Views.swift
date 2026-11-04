@@ -7,6 +7,15 @@ struct RootView: View {
     let state: AppState
 
     var body: some View {
+        if state.quickBarMode {
+            QuickBarView(state: state)
+                .ignoresSafeArea()
+        } else {
+            fullWindow
+        }
+    }
+
+    private var fullWindow: some View {
         VStack(spacing: 0) {
             if !state.focusMode {
                 HeaderBar(state: state)
@@ -58,6 +67,108 @@ struct RootView: View {
         }
         .ignoresSafeArea()
         .frame(minWidth: 360, minHeight: 320)
+    }
+}
+
+// MARK: - Quick bar
+
+/// Small input line shown after a break. Return sends and grows into the full window.
+@MainActor
+struct QuickBarView: View {
+    @Bindable var state: AppState
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !state.quickAttachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(state.quickAttachments) { attachment in
+                            AttachmentChip(attachment: attachment) { state.removeAttachment(attachment) }
+                        }
+                    }
+                    .padding(.top, 10)
+                }
+                .padding(.horizontal, 14)
+            }
+            inputRow
+                .frame(height: 64)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .background(DragHandle())
+        // Drops are received by DropEffectView (AppKit), see Panel.swift.
+        .overlay {
+            if state.dropTargeted {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color.accentColor, lineWidth: 2)
+                    .padding(2)
+            }
+        }
+        .onAppear { focused = true }
+        .onChange(of: state.focusTick) { focused = true }
+    }
+
+    private var inputRow: some View {
+        HStack(spacing: 12) {
+            Button {
+                state.toggleService()
+            } label: {
+                HStack(spacing: 6) {
+                    Circle().fill(state.active.color).frame(width: 8, height: 8)
+                    Text(state.active.title).font(.system(size: 12, weight: .semibold))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Capsule().fill(Color.primary.opacity(0.08)))
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .help(L("Bytt tjeneste (Tab)"))
+
+            TextField(LF("Spør %@ …", state.active.title), text: $state.quickQuery)
+                .textFieldStyle(.plain)
+                .font(.system(size: 17))
+                .focused($focused)
+                .onSubmit { PanelController.shared.expandFromBar(sending: state.quickQuery) }
+
+            HeaderIcon("camera.viewfinder", help: "Ta skjermbilde (⌘⇧S)") {
+                PanelController.shared.captureScreenshot()
+            }
+
+            Image(systemName: "return")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14)
+    }
+}
+
+/// Thumbnail of an attached file, with a button to remove it.
+@MainActor
+struct AttachmentChip: View {
+    let attachment: QuickAttachment
+    let onRemove: () -> Void
+
+    var body: some View {
+        Image(nsImage: AttachmentStore.thumbnail(for: attachment))
+            .resizable()
+            .aspectRatio(contentMode: attachment.isImage ? .fill : .fit)
+            .frame(width: 44, height: 44)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.15)))
+            .overlay(alignment: .topTrailing) {
+                Button(action: onRemove) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+                .offset(x: 5, y: -5)
+            }
+            .padding(.top, 4)
+            .padding(.trailing, 4)
+            .help(attachment.name)
     }
 }
 

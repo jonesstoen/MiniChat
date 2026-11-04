@@ -94,6 +94,16 @@ struct GeneralSettings: View {
                     get: { state.focusMode },
                     set: { if $0 != state.focusMode { state.toggleFocusMode() } }
                 ))
+                Picker("Søkelinje etter pause", selection: $state.idleResetMinutes) {
+                    Text("Av").tag(0)
+                    Text("15 min").tag(15)
+                    Text("30 min").tag(30)
+                    Text("1 time").tag(60)
+                    Text("2 timer").tag(120)
+                }
+                Text("Etter en pause åpner ⌥Space en liten søkelinje for et nytt spørsmål i stedet for den forrige samtalen. ⌘Return i linjen åpner den forrige samtalen.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Toggle("Animasjoner", isOn: $state.animations)
                 Toggle("Toppen får samme farge som nettsiden", isOn: $state.matchPageColor)
             }
@@ -188,7 +198,7 @@ struct PrivacySettings: View {
                 HStack {
                     Button("Vis statistikk") {
                         state.showStats = true
-                        PanelController.shared.show()
+                        PanelController.shared.show(full: true)
                     }
                     Button("Nullstill") { UsageTracker.shared.reset() }
                 }
@@ -222,6 +232,10 @@ struct ShortcutList: View {
             ShortcutItem(keys: "⌥⇧Space", action: "Kikk: vis uten å ta tastaturet"),
         ]),
         ShortcutGroup(title: "I vinduet", items: [
+            ShortcutItem(keys: "Tab", action: "Søkelinjen: bytt tjeneste"),
+            ShortcutItem(keys: "⌘↩", action: "Søkelinjen: åpne forrige samtale"),
+            ShortcutItem(keys: "⌘V", action: "Søkelinjen: legg ved fil eller bilde"),
+            ShortcutItem(keys: "⌘⇧S", action: "Søkelinjen: ta skjermbilde"),
             ShortcutItem(keys: "⌘J", action: "Kommandomeny"),
             ShortcutItem(keys: "⌘1 / ⌘2", action: "ChatGPT / Claude"),
             ShortcutItem(keys: "Ctrl+Tab", action: "Bytt tjeneste"),

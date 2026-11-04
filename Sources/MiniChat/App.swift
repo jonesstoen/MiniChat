@@ -45,7 +45,7 @@ struct MenuContent: View {
                 ForEach(bookmarks) { entry in
                     Button(entry.displayTitle) {
                         AppState.shared.open(entry)
-                        PanelController.shared.show()
+                        PanelController.shared.show(full: true)
                     }
                 }
             }
@@ -93,7 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let firstLaunch = !UserDefaults.standard.bool(forKey: "launchedBefore")
         UserDefaults.standard.set(true, forKey: "launchedBefore")
         if firstLaunch || hotKey == nil {
-            PanelController.shared.show()
+            PanelController.shared.show(full: true)
         }
     }
 
