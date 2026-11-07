@@ -8,8 +8,15 @@ struct RootView: View {
 
     var body: some View {
         if state.quickBarMode {
-            QuickBarView(state: state)
-                .ignoresSafeArea()
+            ZStack {
+                // Keep the pages in the window (invisible) so the fresh chat loads at full
+                // speed while you type. Pages outside the window are slowed down by WebKit.
+                WebContainer(service: state.active)
+                    .opacity(0)
+                    .allowsHitTesting(false)
+                QuickBarView(state: state)
+            }
+            .ignoresSafeArea()
         } else {
             fullWindow
         }
@@ -23,7 +30,7 @@ struct RootView: View {
             }
 
             if state.hotKeyFailed {
-                Text("⌥Space er allerede i bruk av en annen app (for eksempel den gamle ChatGPT-appen). Avslutt den og start Mini Chat på nytt.")
+                Text(LF("%@ er allerede i bruk av en annen app (for eksempel den gamle ChatGPT-appen). Velg en annen hurtigtast i innstillingene, eller avslutt den andre appen og start Mini Chat på nytt.", state.shortcut.display))
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .padding(.horizontal, 12)
@@ -131,8 +138,17 @@ struct QuickBarView: View {
                 .focused($focused)
                 .onSubmit { PanelController.shared.expandFromBar(sending: state.quickQuery) }
 
+            HeaderIcon("paperclip", help: "Legg ved filer (⌘O)") {
+                PanelController.shared.pickFiles()
+            }
+
             HeaderIcon("camera.viewfinder", help: "Ta skjermbilde (⌘⇧S)") {
                 PanelController.shared.captureScreenshot()
+            }
+
+            // No question, just looking for an old chat: open the window with the recent list.
+            HeaderIcon("clock.arrow.circlepath", help: "Åpne vinduet med nylige samtaler") {
+                PanelController.shared.expandFromBar(sending: nil, newChat: false, showHistory: true)
             }
 
             Image(systemName: "return")
@@ -206,6 +222,12 @@ struct HeaderBar: View {
                 active: state.pinned
             ) {
                 state.togglePinned()
+            }
+            HeaderIcon(
+                state.isExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
+                help: state.isExpanded ? "Gjør mindre (⌘E)" : "Utvid (⌘E)"
+            ) {
+                PanelController.shared.toggleExpanded()
             }
             MoreMenu(state: state)
             HeaderIcon("xmark", help: "Skjul (Esc)") {

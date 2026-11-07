@@ -38,7 +38,7 @@ struct MenuBarIcon: View {
 @MainActor
 struct MenuContent: View {
     var body: some View {
-        Button("Vis Mini Chat   ⌥Space") { PanelController.shared.show() }
+        Button("Vis Mini Chat   \(AppState.shared.shortcut.display)") { PanelController.shared.show() }
         let bookmarks = AppState.shared.bookmarks
         if !bookmarks.isEmpty {
             Menu("Bokmerker") {
@@ -67,8 +67,6 @@ struct MenuContent: View {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var hotKey: HotKey?
-    private var peekHotKey: HotKey?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppState.shared.applyDockVisibility()
@@ -79,20 +77,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = WebManager.shared.webView(for: service)
         }
 
-        hotKey = HotKey(id: 1, keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey)) {
-            PanelController.shared.toggle()
-        }
-        // ⌥⇧Space: show the window without taking the keyboard from the current app.
-        peekHotKey = HotKey(id: 2, keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey | shiftKey)) {
-            PanelController.shared.togglePeek()
-        }
-        if hotKey == nil {
-            AppState.shared.hotKeyFailed = true
-        }
+        // The shortcut (⌥Space by default) and its peek variant with ⇧ added.
+        let registered = HotKeyController.shared.register()
 
         let firstLaunch = !UserDefaults.standard.bool(forKey: "launchedBefore")
         UserDefaults.standard.set(true, forKey: "launchedBefore")
-        if firstLaunch || hotKey == nil {
+        if firstLaunch || !registered {
             PanelController.shared.show(full: true)
         }
     }

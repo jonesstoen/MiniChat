@@ -59,6 +59,18 @@ struct GeneralSettings: View {
 
     var body: some View {
         Form {
+            Section("Hurtigtast") {
+                HStack {
+                    Text("Vis og skjul vinduet")
+                    Spacer()
+                    ShortcutRecorder(state: state)
+                }
+                Text(state.shortcut.peek.map { LF("Med ⇧ i tillegg (%@) vises vinduet uten å ta tastaturet fra appen du jobber i.", $0.display) }
+                     ?? L("Kikk-snarveien er av, fordi hurtigtasten allerede bruker ⇧."))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Oppstart") {
                 Toggle("Start ved innlogging", isOn: $launchAtLogin)
                     .onChange(of: launchAtLogin) { _, enabled in
@@ -101,7 +113,13 @@ struct GeneralSettings: View {
                     Text("1 time").tag(60)
                     Text("2 timer").tag(120)
                 }
-                Text("Etter en pause åpner ⌥Space en liten søkelinje for et nytt spørsmål i stedet for den forrige samtalen. ⌘Return i linjen åpner den forrige samtalen.")
+                Picker("Fullt vindu åpnes ved", selection: $state.expandSide) {
+                    Text("Høyre kant").tag(AppState.ExpandSide.right)
+                    Text("Venstre kant").tag(AppState.ExpandSide.left)
+                    Text("Der det var sist").tag(AppState.ExpandSide.lastPosition)
+                }
+                .disabled(state.idleResetMinutes == 0)
+                Text("Etter en pause åpner hurtigtasten en liten søkelinje for et nytt spørsmål i stedet for den forrige samtalen. ↑ henter tidligere spørsmål, og ⌘Return åpner den forrige samtalen.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Toggle("Animasjoner", isOn: $state.animations)
@@ -225,16 +243,24 @@ private struct ShortcutItem: Identifiable {
     var id: String { keys + action }
 }
 
+@MainActor
 struct ShortcutList: View {
-    private let groups: [ShortcutGroup] = [
-        ShortcutGroup(title: "Overalt", items: [
-            ShortcutItem(keys: "⌥Space", action: "Vis / skjul vinduet"),
-            ShortcutItem(keys: "⌥⇧Space", action: "Kikk: vis uten å ta tastaturet"),
-        ]),
+    private var groups: [ShortcutGroup] {
+        let shortcut = AppState.shared.shortcut
+        var global = [ShortcutItem(keys: shortcut.display, action: "Vis / skjul vinduet")]
+        if let peek = shortcut.peek {
+            global.append(ShortcutItem(keys: peek.display, action: "Kikk: vis uten å ta tastaturet"))
+        }
+        return [ShortcutGroup(title: "Overalt", items: global)] + windowGroups
+    }
+
+    private let windowGroups: [ShortcutGroup] = [
         ShortcutGroup(title: "I vinduet", items: [
             ShortcutItem(keys: "Tab", action: "Søkelinjen: bytt tjeneste"),
             ShortcutItem(keys: "⌘↩", action: "Søkelinjen: åpne forrige samtale"),
+            ShortcutItem(keys: "↑ / ↓", action: "Søkelinjen: tidligere spørsmål"),
             ShortcutItem(keys: "⌘V", action: "Søkelinjen: legg ved fil eller bilde"),
+            ShortcutItem(keys: "⌘O", action: "Søkelinjen: velg filer"),
             ShortcutItem(keys: "⌘⇧S", action: "Søkelinjen: ta skjermbilde"),
             ShortcutItem(keys: "⌘J", action: "Kommandomeny"),
             ShortcutItem(keys: "⌘1 / ⌘2", action: "ChatGPT / Claude"),

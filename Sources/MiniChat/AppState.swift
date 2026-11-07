@@ -60,7 +60,24 @@ final class AppState {
         didSet { UserDefaults.standard.set(active.rawValue, forKey: "service") }
     }
     var hotKeyFailed = false
-    var themes: [Service: PageTheme] = [:]
+    /// Page colors, remembered between launches so the top bar and the quick bar
+    /// animation have the right color from the start.
+    var themes: [Service: PageTheme] = AppState.loadThemes()
+
+    nonisolated private static func loadThemes() -> [Service: PageTheme] {
+        guard let saved = UserDefaults.standard.dictionary(forKey: "pageColors") as? [String: [Double]] else { return [:] }
+        var themes: [Service: PageTheme] = [:]
+        for (key, rgb) in saved where rgb.count == 3 {
+            guard let service = Service(rawValue: key) else { continue }
+            themes[service] = makeTheme(red: rgb[0], green: rgb[1], blue: rgb[2])
+        }
+        return themes
+    }
+
+    nonisolated static func makeTheme(red: Double, green: Double, blue: Double) -> PageTheme {
+        let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        return PageTheme(color: Color(.sRGB, red: red, green: green, blue: blue, opacity: 1), isDark: luminance < 0.5)
+    }
 
     /// Whether the service is currently writing an answer.
     var busy: [Service: Bool] = [:]
@@ -93,6 +110,8 @@ final class AppState {
     var dropTargeted = false
     /// True while the screenshot tool is open, so the window doesn't auto-hide.
     @ObservationIgnored var capturingScreenshot = false
+    /// True while the file picker is open, so the window doesn't auto-hide.
+    @ObservationIgnored var pickingFiles = false
     /// Minutes without the window open before ⌥Space shows the quick bar (0 = off).
     var idleResetMinutes: Int = (UserDefaults.standard.object(forKey: "idleResetMinutes") as? Int) ?? 60 {
         didSet { UserDefaults.standard.set(idleResetMinutes, forKey: "idleResetMinutes") }
@@ -105,6 +124,73 @@ final class AppState {
         guard idleResetMinutes > 0 else { return false }
         guard let lastHidden else { return true }
         return Date().timeIntervalSince(lastHidden) >= Double(idleResetMinutes) * 60
+    }
+
+    enum ExpandSide: String, CaseIterable {
+        case right, left, lastPosition
+    }
+
+    /// Where the full window opens when the quick bar expands.
+    var expandSide: ExpandSide = ExpandSide(rawValue: UserDefaults.standard.string(forKey: "expandSide") ?? "") ?? .right {
+        didSet { UserDefaults.standard.set(expandSide.rawValue, forKey: "expandSide") }
+    }
+
+    /// The global shortcut that shows and hides the window.
+    var shortcut: Shortcut = AppState.loadShortcut() {
+        didSet {
+            if let data = try? JSONEncoder().encode(shortcut) {
+                UserDefaults.standard.set(data, forKey: "shortcut")
+            }
+        }
+    }
+
+    nonisolated private static func loadShortcut() -> Shortcut {
+        guard let data = UserDefaults.standard.data(forKey: "shortcut"),
+              let shortcut = try? JSONDecoder().decode(Shortcut.self, from: data) else { return .defaultShortcut }
+        return shortcut
+    }
+
+    // MARK: Quick bar question history (↑ / ↓)
+
+    @ObservationIgnored private var promptHistory: [String] =
+        UserDefaults.standard.stringArray(forKey: "promptHistory") ?? []
+    @ObservationIgnored private var historyIndex: Int?
+    @ObservationIgnored private var historyDraft = ""
+
+    func recordPrompt(_ prompt: String) {
+        guard rememberHistory, !prompt.isEmpty else { return }
+        promptHistory.removeAll { $0 == prompt }
+        promptHistory.append(prompt)
+        if promptHistory.count > 50 { promptHistory.removeFirst(promptHistory.count - 50) }
+        UserDefaults.standard.set(promptHistory, forKey: "promptHistory")
+    }
+
+    func resetPromptNavigation() {
+        historyIndex = nil
+        historyDraft = ""
+    }
+
+    /// ↑ goes to older questions, ↓ to newer, and past the newest back to what you were typing.
+    func navigatePrompts(older: Bool) {
+        guard !promptHistory.isEmpty else { return }
+        if older {
+            if let index = historyIndex {
+                historyIndex = max(0, index - 1)
+            } else {
+                historyDraft = quickQuery
+                historyIndex = promptHistory.count - 1
+            }
+        } else {
+            guard let index = historyIndex else { return }
+            if index + 1 < promptHistory.count {
+                historyIndex = index + 1
+            } else {
+                historyIndex = nil
+                quickQuery = historyDraft
+                return
+            }
+        }
+        if let index = historyIndex { quickQuery = promptHistory[index] }
     }
 
     /// Privacy: puts a neutral cover over the chat.
@@ -187,6 +273,8 @@ final class AppState {
     func clearHistory() {
         history.removeAll { !$0.bookmarked }
         saveHistory()
+        promptHistory = []
+        UserDefaults.standard.removeObject(forKey: "promptHistory")
     }
 
     var bookmarks: [ChatEntry] {
@@ -339,13 +427,12 @@ final class AppState {
     }
 
     func setTheme(red: Double, green: Double, blue: Double, for service: Service) {
-        let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-        let theme = PageTheme(
-            color: Color(.sRGB, red: red, green: green, blue: blue, opacity: 1),
-            isDark: luminance < 0.5
-        )
+        let theme = Self.makeTheme(red: red, green: green, blue: blue)
         if themes[service] != theme {
             withAnimation(.easeInOut(duration: 0.25)) { themes[service] = theme }
+            var saved = UserDefaults.standard.dictionary(forKey: "pageColors") as? [String: [Double]] ?? [:]
+            saved[service.rawValue] = [red, green, blue]
+            UserDefaults.standard.set(saved, forKey: "pageColors")
         }
         if service == active { applyAppearance() }
     }

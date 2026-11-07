@@ -19,6 +19,11 @@ final class ChatPanel: NSPanel {
                 PanelController.shared.expandFromBar(sending: nil, newChat: false)
                 return
             }
+            // ↑ / ↓: earlier questions, like in Terminal.
+            if flags.subtracting([.function, .numericPad]).isEmpty, event.keyCode == 126 || event.keyCode == 125 {
+                AppState.shared.navigatePrompts(older: event.keyCode == 126)
+                return
+            }
         }
         // Command palette: arrow keys and Esc.
         if event.type == .keyDown, AppState.shared.showPalette, attachedSheet == nil {
@@ -51,6 +56,10 @@ final class ChatPanel: NSPanel {
             if flags == .command, key == "v", state.attachFromPasteboard() { return true }
             if flags == [.command, .shift], key == "s" {
                 PanelController.shared.captureScreenshot()
+                return true
+            }
+            if flags == .command, key == "o" {
+                PanelController.shared.pickFiles()
                 return true
             }
         }
@@ -231,6 +240,28 @@ final class PanelController {
     private var barFullFrame: NSRect?
     private static let normalMinSize = NSSize(width: 360, height: 320)
     private static let barHeight: CGFloat = 64
+    /// The window content, faded out while the bar grows into the full window.
+    private weak var hostingView: NSView?
+    private static let barWidth: CGFloat = 640
+
+    private static func screenUnderMouse() -> NSScreen {
+        let mouse = NSEvent.mouseLocation
+        return NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main ?? NSScreen.screens[0]
+    }
+
+    /// Where the full window goes when the quick bar expands: along the chosen screen
+    /// edge, so it stays clear of what you're working on. Keeps the window's usual size.
+    private func expandedFrame(size: NSSize) -> NSRect? {
+        let side = AppState.shared.expandSide
+        guard side != .lastPosition else { return nil }
+        let screen = panel.screen ?? Self.screenUnderMouse()
+        let visible = screen.visibleFrame
+        let margin: CGFloat = 6 // close to the edge, out of the way
+        let width = min(size.width, visible.width - margin * 2)
+        let height = min(size.height, visible.height - margin * 2)
+        let x = side == .right ? visible.maxX - margin - width : visible.minX + margin
+        return NSRect(x: x, y: visible.maxY - margin - height, width: width, height: height)
+    }
     private var hoverTimer: Timer?
 
     var isShowing: Bool { panel.isVisible && panel.alphaValue > 0.5 }
@@ -266,6 +297,7 @@ final class PanelController {
         effect.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
         let hosting = NSHostingView(rootView: RootView(state: AppState.shared))
+        hostingView = hosting
         hosting.sizingOptions = []
         hosting.translatesAutoresizingMaskIntoConstraints = false
         effect.addSubview(hosting)
@@ -397,12 +429,19 @@ final class PanelController {
         barFullFrame = fullFrame
         panel.setFrameAutosaveName("")
         panel.minSize = NSSize(width: 300, height: 50)
-        let bar = NSRect(x: fullFrame.minX, y: fullFrame.maxY - Self.barHeight,
-                         width: fullFrame.width, height: Self.barHeight)
+        // Centered in the lower part of the screen the mouse is on, like a command bar.
+        let visible = Self.screenUnderMouse().visibleFrame
+        let width = min(Self.barWidth, visible.width - 40)
+        let bar = NSRect(x: visible.midX - width / 2,
+                         y: visible.minY + visible.height * 0.1,
+                         width: width, height: Self.barHeight)
         panel.setFrame(bar, display: false)
         state.quickQuery = ""
         state.quickAttachments = []
+        state.resetPromptNavigation()
         state.quickBarMode = true
+        // Open empty chats in the background while you type, so Return is instant.
+        WebManager.shared.prewarmNewChat()
     }
 
     /// Makes room for the attachment row (keeps the top edge where it is).
@@ -416,6 +455,31 @@ final class PanelController {
         frame.size.height = height
         frame.origin.y = top - height
         panel.setFrame(frame, display: true, animate: state.animations)
+    }
+
+    /// Opens the standard file picker and attaches the chosen files.
+    func pickFiles() {
+        let state = AppState.shared
+        guard state.quickBarMode, !state.pickingFiles else { return }
+        let picker = NSOpenPanel()
+        picker.allowsMultipleSelection = true
+        picker.canChooseDirectories = false
+        picker.canChooseFiles = true
+        picker.message = L("Velg filer å legge ved")
+        picker.prompt = L("Legg ved")
+        // Above the floating bar, so it isn't hidden behind it.
+        picker.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+
+        state.pickingFiles = true
+        NSApp.activate(ignoringOtherApps: true)
+        picker.begin { response in
+            MainActor.assumeIsolated {
+                state.pickingFiles = false
+                if response == .OK { state.addAttachments(picker.urls) }
+                self.panel.makeKeyAndOrderFront(nil)
+                state.focusTick += 1
+            }
+        }
     }
 
     /// Lets you drag a box around part of the screen and attaches the result.
@@ -454,46 +518,54 @@ final class PanelController {
 
     /// Grows the quick bar into the full window. With text, starts a new chat
     /// and sends it. Without text, opens a new chat (or the previous one if newChat is false).
-    func expandFromBar(sending text: String?, newChat: Bool = true) {
+    /// With showHistory, the recent chats list opens once the window is in place.
+    func expandFromBar(sending text: String?, newChat: Bool = true, showHistory: Bool = false) {
         let state = AppState.shared
         guard state.quickBarMode, let fullFrame = barFullFrame else { return }
         barFullFrame = nil
         let service = state.active
         let prompt = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        state.recordPrompt(prompt)
+        state.resetPromptNavigation()
 
-        withAnimation(.easeOut(duration: 0.2)) { state.quickBarMode = false }
         panel.minSize = Self.normalMinSize
-        animate(to: fullFrame) {
-            if self.collapsedFrame == nil { self.panel.setFrameAutosaveName("MiniChatPanel") }
-        }
+        let target = expandedFrame(size: fullFrame.size) ?? fullFrame
+        morphBar(into: target)
 
         let files = newChat ? state.quickAttachments.map(\.url) : []
         state.quickAttachments = []
         if !prompt.isEmpty || !files.isEmpty {
-            WebManager.shared.startChat(prompt, files: files, in: service)
+            WebManager.shared.sendFromBar(prompt, files: files, in: service)
         } else if newChat {
-            WebManager.shared.newChat(service)
+            WebManager.shared.keepFreshChat(in: service)
+        } else {
+            WebManager.shared.undoPrewarm() // ⌘Return: back to the previous chat
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             WebManager.shared.focusInput(service)
             WebManager.shared.refreshTheme(service)
+            if showHistory { state.showHistory = true }
         }
     }
 
     /// Puts the window back to its full size after hiding from the quick bar.
     private func leaveBarModeAfterHide() {
         let state = AppState.shared
+        hostingView?.alphaValue = 1 // in case the window was hidden mid-animation
         guard state.quickBarMode else { return }
         state.quickBarMode = false
         state.quickAttachments = []
+        WebManager.shared.undoPrewarm()
         panel.minSize = Self.normalMinSize
         if let fullFrame = barFullFrame { panel.setFrame(fullFrame, display: false) }
         barFullFrame = nil
-        if collapsedFrame == nil { panel.setFrameAutosaveName("MiniChatPanel") }
+        if collapsedFrame == nil { resumeFrameAutosave() }
     }
 
     func hide() {
         guard panel.isVisible else { return }
+        morphWindow?.orderOut(nil)
+        morphWindow = nil
         // Closing the quick bar without asking anything doesn't count as using the chat.
         if !AppState.shared.quickBarMode { AppState.shared.lastHidden = Date() }
         AppState.shared.showHistory = false
@@ -547,7 +619,8 @@ final class PanelController {
     // MARK: Pin
 
     fileprivate func panelResignedKey() {
-        guard !AppState.shared.pinned, !AppState.shared.capturingScreenshot else { return }
+        guard !AppState.shared.pinned, !AppState.shared.capturingScreenshot,
+              !AppState.shared.pickingFiles else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             // Don't hide if focus only moved to one of the app's own windows
             // (sign-in, file picker, dialog, history).
@@ -570,7 +643,7 @@ final class PanelController {
         if collapsedFrame != nil {
             collapsedFrame = nil
             AppState.shared.isExpanded = false
-            panel.setFrameAutosaveName("MiniChatPanel")
+            resumeFrameAutosave()
         }
         let visible = screen.visibleFrame
         let margin: CGFloat = 12
@@ -601,7 +674,7 @@ final class PanelController {
             collapsedFrame = nil
             state.isExpanded = false
             animate(to: collapsed) {
-                self.panel.setFrameAutosaveName("MiniChatPanel")
+                self.resumeFrameAutosave()
             }
             return
         }
@@ -621,6 +694,134 @@ final class PanelController {
         state.isExpanded = true
         panel.setFrameAutosaveName("") // don't remember the large size for next time
         animate(to: NSRect(x: x, y: y, width: width, height: height))
+    }
+
+    /// Turns frame saving back on without moving the window. Setting the autosave name
+    /// makes AppKit restore the last saved frame, so the current frame is saved first.
+    /// (Without this, the window jumped back to its old spot after the bar expanded.)
+    private func resumeFrameAutosave() {
+        panel.saveFrame(usingName: "MiniChatPanel")
+        panel.setFrameAutosaveName("MiniChatPanel")
+    }
+
+    /// A borderless overlay window used only during the bar-to-window animation.
+    private var morphWindow: NSWindow?
+
+    /// Grows the bar into the full window.
+    ///
+    /// Resizing the real window frame by frame stutters, because every step makes
+    /// AppKit lay out the whole window, web page included. Instead, a lightweight
+    /// rounded "ghost" in an overlay window is animated with a Core Animation spring
+    /// (GPU-driven and synced to the display), while the real window is put at its
+    /// final size, invisible, in one go. When the ghost lands, the window fades in on top.
+    private func morphBar(into target: NSRect) {
+        let state = AppState.shared
+        let finish = {
+            if self.collapsedFrame == nil { self.resumeFrameAutosave() }
+            self.panel.invalidateShadow()
+        }
+        hostingView?.alphaValue = 1
+        guard state.animations else {
+            state.quickBarMode = false
+            panel.setFrame(target, display: true)
+            finish()
+            return
+        }
+
+        let start = panel.frame
+        // Room for the shadow, but kept on screen: macOS may move a window that sticks
+        // out past the edge, which would shift the ghost away from where the window lands.
+        var area = start.union(target).insetBy(dx: -60, dy: -60)
+        if let screenFrame = (panel.screen ?? NSScreen.main)?.frame {
+            area = area.intersection(screenFrame)
+        }
+        let overlay = NSWindow(contentRect: area, styleMask: .borderless, backing: .buffered, defer: false)
+        overlay.isOpaque = false
+        overlay.backgroundColor = .clear
+        overlay.hasShadow = false
+        overlay.ignoresMouseEvents = true
+        overlay.isReleasedWhenClosed = false
+        overlay.level = panel.level
+        overlay.collectionBehavior = panel.collectionBehavior
+        let host = NSView(frame: NSRect(origin: .zero, size: area.size))
+        host.wantsLayer = true
+        overlay.contentView = host
+
+        overlay.order(.above, relativeTo: panel.windowNumber)
+        morphWindow = overlay
+        // Measure from where the overlay actually ended up.
+        let origin = overlay.frame.origin
+
+        let ghost = CALayer()
+        ghost.frame = start.offsetBy(dx: -origin.x, dy: -origin.y)
+        ghost.cornerRadius = Self.cornerRadius
+        ghost.cornerCurve = .continuous
+        ghost.backgroundColor = Self.ghostColor()
+        ghost.borderWidth = 0.5
+        ghost.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        ghost.shadowColor = NSColor.black.cgColor
+        ghost.shadowOpacity = 0.35
+        ghost.shadowRadius = 18
+        ghost.shadowOffset = CGSize(width: 0, height: -6)
+        host.layer?.addSublayer(ghost)
+
+        // The real window: hidden, swapped to the full chat and placed at its final size.
+        panel.alphaValue = 0
+        state.quickBarMode = false
+        panel.setFrame(target, display: true)
+
+        // A non-bouncy spring, like SwiftUI's default ".smooth" motion.
+        let duration = 0.42
+        // Aim for where the real window actually is (macOS may have adjusted the frame).
+        let end = panel.frame.offsetBy(dx: -origin.x, dy: -origin.y)
+        let moves: [(String, NSValue, NSValue)] = [
+            ("position", NSValue(point: ghost.position), NSValue(point: CGPoint(x: end.midX, y: end.midY))),
+            ("bounds", NSValue(rect: ghost.bounds), NSValue(rect: CGRect(origin: .zero, size: end.size))),
+        ]
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (keyPath, from, to) in moves {
+            let spring = CASpringAnimation(perceptualDuration: duration, bounce: 0)
+            spring.keyPath = keyPath
+            spring.fromValue = from
+            spring.toValue = to
+            spring.duration = spring.settlingDuration
+            ghost.add(spring, forKey: keyPath)
+        }
+        ghost.position = CGPoint(x: end.midX, y: end.midY)
+        ghost.bounds = CGRect(origin: .zero, size: end.size)
+        CATransaction.commit()
+
+        // Hand over to the real window while the ghost is in its final, barely moving tail.
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration * 0.8) {
+            guard self.morphWindow === overlay else { return }
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.18
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                self.panel.animator().alphaValue = 1
+                overlay.animator().alphaValue = 0
+            }, completionHandler: {
+                MainActor.assumeIsolated {
+                    overlay.orderOut(nil)
+                    if self.morphWindow === overlay { self.morphWindow = nil }
+                    finish()
+                }
+            })
+        }
+    }
+
+    /// The ghost's color: the page color the top bar uses, so the hand-over is seamless.
+    private static func ghostColor() -> CGColor {
+        let state = AppState.shared
+        if state.matchPageColor, let color = state.themes[state.active]?.color {
+            return NSColor(color).cgColor
+        }
+        // Resolve the system color for the current light/dark mode.
+        var color = NSColor.black.cgColor
+        NSApp.effectiveAppearance.performAsCurrentDrawingAppearance {
+            color = NSColor.windowBackgroundColor.cgColor
+        }
+        return color
     }
 
     private func animate(to frame: NSRect, completion: (() -> Void)? = nil) {
